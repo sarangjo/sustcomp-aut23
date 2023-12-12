@@ -3,7 +3,6 @@ import csv
 import sys
 import datetime
 import random
-import math
 from typing import List, Optional, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -58,15 +57,12 @@ class CloudScheduler:
 
     # Hardware specs
     hardware_specs = {
-        "xeon_platinum_8124": {
-            "cores": 18,
-            "clock_speed": 3,  # GHz
-            "mflo_per_sec": 66433,  # MOps/sec
-            # TODO needs adjusting, this number represents Server-Side Java but we are trying to be a bit more general.
-            # It's also using the numbers for Xeon Platinum 8180 from https://www.spec.org/power_ssj2008/results/power_ssj2008.html
-            "watts_per_mflop": .03,
-            "embodied_carbon": 1344.1,  # kgCO2eq
-            "lifetime": AVG_HARDWARE_USAGE_PER_YR_HRS * 5,
+        "xeon_e5_2670": {
+            "cores": 10,
+            "embodied_carbon": 2216.20,
+            "tdp": 115,
+            "tdp_coefficient": 0.25,
+            "lifetime": AVG_HARDWARE_USAGE_PER_YR_HRS * 4.2,
         },
         "amd_epyc_7571": {
             "cores": 32,
@@ -75,14 +71,21 @@ class CloudScheduler:
             "tdp_coefficient": 0.3,
             "lifetime": AVG_HARDWARE_USAGE_PER_YR_HRS * 4.5,
         },
+        "xeon_platinum_8176": {
+            "cores": 28,
+            "embodied_carbon": 35762.3,
+            "tdp": 165,
+            "tdp_coefficient": 0.3,
+            "lifetime": AVG_HARDWARE_USAGE_PER_YR_HRS * 3.8,
+        }
     }
 
-    # AVG_HARDWARE_LIFE_YRS = random.randint(2, 7)
-
-    def __init__(self, intensity_data_fname: str):
+    def __init__(self, intensity_data_fname: str, slot_algo: str):
         self.intensity_data = _collect_caiso_data_1(intensity_data_fname)
+        self.slot_algo = slot_algo
         # Pair of (Amount of energy scheduled, list of jobs and time to run) for each hour of the day
         self.current_allocation = [HourlyAllocation() for i in range(24)]
+        self.allocation_by_job = {}
         self.job_carbon = []
 
     @staticmethod
@@ -119,60 +122,40 @@ class CloudScheduler:
         return en
 
     def submit_job(self, job) -> Optional[float]:
-        """
-        Okay! Now let's just simply allocate with no brains. We need to specify some sort of capacity to
-        limit how many jobs can all be allocated to the lowest emissions.
-
-        Returns allocation and total carbon
-        """
         # Start with embodied carbon
         embCarbon = CloudScheduler.embodied_carbon(job)
 
         # Optimize for operational carbon
         operCarbon = 0.0
 
-        slots = self.get_best_slots(job, "simple")
+        slots = self.get_best_slots(job)
         if len(slots) == 0:
             return None
 
         energy_per_hr = CloudScheduler.energy_per_hr(job)
 
+        allocation = [0] * 24
+
         for (idx, intensity, time_usage) in slots:
             self.current_allocation[idx].energy += energy_per_hr * time_usage
             self.current_allocation[idx].jobs.append(
                 {"id": job["id"], "time": time_usage})
+            allocation[idx] += time_usage
             operCarbon += intensity * energy_per_hr * time_usage
 
+        self.allocation_by_job[job["id"]] = allocation
         self.job_carbon.append(embCarbon + operCarbon)
 
         return embCarbon + operCarbon
 
-        # Step 2: get best slots
-        slots = self.get_best_slots_v1(method="dampened")[:num_slots]
-
-        # Precompute the total carbon this "best allocation" would take
-        for (idx, intensity) in slots[:full_slots]:
-            carbon += energy_per_hr
-        if num_slots != full_slots:
-            (idx, intensity) = slots[full_slots]
-            carbon += intensity * energy_per_hr * (time_required_hrs % 1)
-
-        # Is this possible?
-        if carbon > float(job["carbon_budget"]):
-            return False
-
-    def get_best_slots(self, job, method) -> List[Tuple[int, float, float]]:
-        if method == "simple":
+    def get_best_slots(self, job) -> List[Tuple[int, float, float]]:
+        if self.slot_algo == "simple":
             return self.get_best_slots_v1(job, False)
-        elif method == "min_alloc":
+        elif self.slot_algo == "min_alloc":
             return self.get_best_slots_v1(job, True)
-        elif method == "max_under":
-            return self.get_best_slots_max_under(job)
+        # else ... other algorithms here!
 
     def get_best_slots_v1(self, job, dampen=False):
-        """
-        Simply by intensity (which is sorted) and curbing by capacity
-        """
         after = [(idx, self.get_adjusted_intensity(idx) if dampen else self.get_intensity(idx)) for idx in range(24)]
         sorted_slots = sorted(after, key=lambda o: o[1])
 
@@ -184,7 +167,6 @@ class CloudScheduler:
         best_slots = []
 
         # Allocate job, compute overall carbon, return success
-        # Whole hours
         for (idx, intensity) in sorted_slots:
             time_usage = min(1, time_required_hrs)
 
@@ -202,24 +184,23 @@ class CloudScheduler:
 
         return best_slots if success else []
 
-    def get_best_slots_max_under(self, job):
-        pass
-
     def get_intensity(self, idx):
         return self.intensity_data[idx]["AvgCarbonIntensity"]
 
     def get_adjusted_intensity(self, idx):
         return self.intensity_data[idx]["AvgCarbonIntensity"] + \
-            3.5e6*self.current_allocation[idx].energy / \
+            200e6*self.current_allocation[idx].energy / \
             self.intensity_data[idx]["AvgCarbonIntensity"]
 
-    def show_allocation(self, save=False):
-        for x in self.current_allocation:
+    def show_allocation(self, show=False):
+        for i,x in enumerate(self.current_allocation):
+            if x.energy == 0:
+                continue
             job_descr = ", ".join(
                 [f'job {j["id"]} for {j["time"]:.3f} hr(s)' for j in x.jobs])
-            print(f"{x.energy*(10**6):.3f}\t{job_descr}")
+            print(f"{i}:00\t{x.energy*(10**6):.3f}Wh\t{job_descr}")
 
-        print(self.job_carbon)
+        print("Job carbon:", self.job_carbon)
 
         fig, ax1 = plt.subplots()
         color = 'tab:blue'
@@ -237,30 +218,24 @@ class CloudScheduler:
         ax2.tick_params(axis='y', labelcolor=color)
 
         fig.tight_layout()
-        plt.show()
+        if show: plt.show()
 
 
 # Jobs
-SAMPLE_JOB = {
-    # "mflo": 30e6,  # Play around with this to find a reasonable # of megaflops
-    "id": 1,
-    "server_utilization": .32,
-    "time": datetime.timedelta(hours=1.5),  # hours
-    "hardware": "amd_epyc_7571"
-}
-JOBS = [
+RANDOM_JOBS = [
     {
         "id": i,
-        "server_utilization": random.random() / 4.5 + 0.2,
+        "server_utilization": random.random() / 4.5 + 0.05,
         "time": datetime.timedelta(hours=random.random() * 2 + 0.5),
-        "hardware": "amd_epyc_7571",
+        "hardware": list(CloudScheduler.hardware_specs.keys())[int(random.random() * 3)],
+        "carbon_budget": 2,
     }
     for i in range(10)
 ]
 
 
-def main():
-    scheduler = CloudScheduler("caiso-data/day_forecast_aci.csv")
+def main(alloc):
+    scheduler = CloudScheduler("caiso-data/day_forecast_aci.csv", alloc)
 
     jobs = _read_jobs("sample_jobs.csv")
 
@@ -269,61 +244,10 @@ def main():
         if res == None:
             print("Failed to allocate job", j["id"])
         else:
-            print("Allocated job", j["id"], "with carbon", res)
+            print("Allocated job", j["id"], "with carbon", f"{res:.5f}")
 
-    scheduler.show_allocation()
-
-
-def jan_caiso():
-    data = _collect_caiso_data_1("full_caiso.csv")
-
-    plt.plot([d["Datetime"] for d in data], [
-             d["AvgCarbonIntensity"] for d in data])
-    plt.xlabel("Date")
-    plt.ylabel("Average Carbon Intensity (kgCO2/MWh)")
-    plt.title("CAISO Historical Data (January 2022)")
-    plt.show()
-
-
-def year_caiso_lowest_intensity():
-    data = _collect_caiso_data_2("caiso-data/CAISO_aci_2022.csv")
-
-    # Go day by day
-    filtered_data = []
-    for i in range(0, len(data), 24):
-        filtered_data.append(
-            min(data[i:i+24], key=lambda d: d["AvgCarbonIntensity"]))
-
-    plt.plot([d["Datetime"] for d in data], [
-             d["AvgCarbonIntensity"] for d in data])
-    plt.xlabel("Date")
-    plt.ylabel("Average Carbon Intensity (kgCO2/MWh)")
-    plt.title("CAISO Lowest ACI By Day (2022)")
-    plt.savefig("CAISO_Lowest_Intensity_By_Day.png")
-    plt.show()
-
-
-def day_caiso_intensity():
-    # Pick my favorite day
-    day_index = 190
-
-    data = _collect_caiso_data_2(
-        "caiso-data/CAISO_aci_2022.csv")[day_index*24:(day_index+1)*24]
-
-    plt.plot([d["Datetime"] for d in data], [
-             d["AvgCarbonIntensity"] for d in data])
-    plt.xlabel("Time")
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    plt.ylabel("Average Carbon Intensity (kgCO2/MWh)")
-    plt.title("CAISO Reported ACI for 10-Jul-2022")
-    plt.savefig("CAISO_Reported_2022_07_10.png")
-    # plt.show()
+    scheduler.show_allocation(False)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "caiso_year":
-        year_caiso_lowest_intensity()
-    elif len(sys.argv) > 1 and sys.argv[1] == "caiso_day":
-        day_caiso_intensity()
-    else:
-        main()
+    main(sys.argv[1] if len(sys.argv) > 1 else "simple")

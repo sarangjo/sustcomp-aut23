@@ -1,2 +1,11 @@
 id,server_utilization,time,hardware,carbon_budget
-1,0.13,2,amd_epyc_7571,.1
+1,0.13,1,amd_epyc_7571,.1
+2,0.15,.75,xeon_e5_2670,.95
+3,0.2,.4,xeon_platinum_8176,.45
+4,0.22,1.32,amd_epyc_7571,.2
+5,.175,.9,xeon_e5_2670,.075
+6,.19,.5,xeon_e5_2670,.05
+7,.1,.25,xeon_platinum_8176,.3
+8,.25,1.1,amd_epyc_7571,.1
+9,.2,.65,xeon_e5_2670,0.05
+10,.185,.2,xeon_platinum_8176,.6
